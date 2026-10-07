@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 
 // ==========================================
 // 1. TYPES & INTERFACES
@@ -48,6 +48,7 @@ interface SchoolSettings {
   status: ElectionStatus;
   showResults: boolean;
   showWinners: boolean;
+  logo?: string; // data-URL logo hasil upload (opsional)
 }
 
 // ==========================================
@@ -222,11 +223,63 @@ const IconServer = ({ className = "w-5 h-5" }) => (
   </svg>
 );
 
-const IconRefresh = ({ className = "w-5 h-5" }) => (
-  <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-  </svg>
-);
+// ==========================================
+// HELPERS & LOGO
+// ==========================================
+const ADMIN_USER: string = (import.meta as any).env?.VITE_ADMIN_USERNAME || 'admin';
+const ADMIN_PASS: string = (import.meta as any).env?.VITE_ADMIN_PASSWORD || 'admin123';
+
+// Waktu suara dibulatkan ke jam agar tidak bisa dicocokkan dengan waktu memilih seorang siswa (menjaga kerahasiaan)
+const hourOnly = (iso: string) => iso.slice(0, 13) + ':00:00.000Z';
+
+function resizeImage(file: File, max: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) return reject(new Error('File harus berupa gambar (PNG/JPG/WEBP).'));
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Gagal membaca file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Gambar tidak valid.'));
+      img.onload = () => {
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d')?.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL(file.type === 'image/png' ? 'image/png' : 'image/jpeg', 0.85));
+      };
+      img.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function downloadCSV(filename: string, rows: (string | number)[][]) {
+  const esc = (v: string | number) => {
+    const t = String(v ?? '');
+    return /[",\n;]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const blob = new Blob(['\uFEFF' + rows.map(r => r.map(esc).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Logo: memakai logo upload (Pengaturan) -> /logo.png -> teks "OSIS" bila gambar tidak ditemukan
+const LogoCtx = React.createContext<string>('/logo.png');
+
+const SchoolLogo = ({ className = "w-12 h-12" }: { className?: string }) => {
+  const src = React.useContext(LogoCtx);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setFailed(false); }, [src]);
+  if (failed) {
+    return <div className={`${className} bg-amber-400 text-blue-950 rounded-full flex items-center justify-center font-bold text-xs shrink-0`}>OSIS</div>;
+  }
+  return <img src={src} alt="Logo sekolah" onError={() => setFailed(true)} className={`${className} object-contain shrink-0`} />;
+};
 
 // ==========================================
 // 4. MAIN APP COMPONENT
@@ -235,7 +288,7 @@ export default function App() {
   // Persistence with LocalStorage
   const [settings, setSettings] = useState<SchoolSettings>(() => {
     const saved = localStorage.getItem('evoting_settings');
-    return saved ? JSON.parse(saved) : INITIAL_SETTINGS;
+    return saved ? { ...INITIAL_SETTINGS, ...JSON.parse(saved) } : INITIAL_SETTINGS;
   });
 
   const [candidates, setCandidates] = useState<Candidate[]>(() => {
@@ -259,7 +312,7 @@ export default function App() {
   });
 
   // App Navigation State
-  const [activeTab, setActiveTab] = useState<'landing' | 'voter_login' | 'voting' | 'admin_login' | 'admin_dashboard'>('landing');
+  const [activeTab, setActiveTab] = useState<'landing' | 'voter_login' | 'voting' | 'admin_login' | 'admin_dashboard' | 'public_results'>('landing');
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   
   // Current Voter Session
@@ -292,6 +345,23 @@ export default function App() {
     localStorage.setItem('evoting_logs', JSON.stringify(auditLogs));
   }, [auditLogs]);
 
+  // Sinkronisasi antar tab browser (mis. tab admin otomatis memperbarui angka saat tab lain memilih)
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (!e.newValue) return;
+      try {
+        const d = JSON.parse(e.newValue);
+        if (e.key === 'evoting_settings') setSettings(d);
+        else if (e.key === 'evoting_candidates') setCandidates(d);
+        else if (e.key === 'evoting_voters') setVotersDB(d);
+        else if (e.key === 'evoting_votes') setVotes(d);
+        else if (e.key === 'evoting_logs') setAuditLogs(d);
+      } catch { /* abaikan data rusak */ }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
   // Helper for audit log
   const addLog = (action: string, details: string) => {
     const newLog: AuditLog = {
@@ -308,8 +378,18 @@ export default function App() {
   const handleFinalSubmitVote = () => {
     if (!currentVoter || !selectedKetua || !selectedWakil) return;
 
-    // 1. Double check voter status
-    const latestVoter = votersDB.find(v => v.id === currentVoter.id);
+    // 0. Pemilihan harus masih berlangsung
+    if (settings.status !== 'berlangsung') {
+      alert('Pemilihan sedang tidak berlangsung. Suara tidak dapat dikirim.');
+      setCurrentVoter(null);
+      setActiveTab('landing');
+      return;
+    }
+
+    // 1. Cek ulang status pemilih dari data terbaru (mencegah dobel vote lewat dua tab)
+    let storedVoters: Voter[] = votersDB;
+    try { storedVoters = JSON.parse(localStorage.getItem('evoting_voters') || '') as Voter[]; } catch { /* pakai state */ }
+    const latestVoter = storedVoters.find(v => v.id === currentVoter.id);
     if (!latestVoter || latestVoter.has_voted) {
       alert('Gagal: Anda telah memberikan suara sebelumnya atau data tidak valid.');
       setActiveTab('landing');
@@ -323,14 +403,14 @@ export default function App() {
       id: 'vote-' + Date.now() + '-1',
       candidate_id: selectedKetua.id,
       candidate_type: 'ketua',
-      created_at: now,
+      created_at: hourOnly(now),
     };
 
     const newVoteWakil: Vote = {
       id: 'vote-' + Date.now() + '-2',
       candidate_id: selectedWakil.id,
       candidate_type: 'wakil',
-      created_at: now,
+      created_at: hourOnly(now),
     };
 
     setVotes(prev => [...prev, newVoteKetua, newVoteWakil]);
@@ -357,13 +437,15 @@ export default function App() {
   };
 
   return (
+    <LogoCtx.Provider value={settings.logo || '/logo.png'}>
     <div className="min-h-screen bg-slate-100 font-sans text-slate-900 selection:bg-blue-500 selection:text-white">
       {/* Dynamic Render based on Navigation */}
       {activeTab === 'landing' && (
         <LandingPage 
           settings={settings} 
           onStartVote={() => setActiveTab('voter_login')} 
-          onAdminLogin={() => setActiveTab('admin_login')} 
+          onAdminLogin={() => setActiveTab('admin_login')}
+          onShowResults={() => setActiveTab('public_results')} 
         />
       )}
 
@@ -397,6 +479,10 @@ export default function App() {
         />
       )}
 
+      {activeTab === 'public_results' && (
+        <PublicResultsPage settings={settings} candidates={candidates} votes={votes} onBack={() => setActiveTab('landing')} />
+      )}
+
       {activeTab === 'admin_login' && (
         <AdminLoginPage 
           onSuccess={() => {
@@ -427,20 +513,19 @@ export default function App() {
         />
       )}
     </div>
+    </LogoCtx.Provider>
   );
 }
 
 // ==========================================
 // 5. LANDING PAGE COMPONENT
 // ==========================================
-function LandingPage({ settings, onStartVote, onAdminLogin }: { settings: SchoolSettings; onStartVote: () => void; onAdminLogin: () => void }) {
+function LandingPage({ settings, onStartVote, onAdminLogin, onShowResults }: { settings: SchoolSettings; onStartVote: () => void; onAdminLogin: () => void; onShowResults?: () => void }) {
   return (
     <div className="min-h-screen flex flex-col justify-between bg-gradient-to-br from-blue-900 via-indigo-900 to-slate-900 text-white">
       <header className="p-6 flex justify-between items-center max-w-7xl mx-auto w-full">
         <div className="flex items-center space-x-3">
-          <div className="w-12 h-12 bg-amber-400 rounded-full flex items-center justify-center font-bold text-blue-950 shadow-lg text-xl">
-            OSIS
-          </div>
+          <SchoolLogo className="w-12 h-12" />
           <div>
             <h1 className="font-bold text-lg leading-tight">{settings.name}</h1>
             <p className="text-xs text-blue-200">{settings.year}</p>
@@ -474,6 +559,12 @@ function LandingPage({ settings, onStartVote, onAdminLogin }: { settings: School
           <span>MULAI MEMILIH SEKARANG</span>
           <IconCheck className="w-6 h-6" />
         </button>
+
+        {settings.showResults && onShowResults && (
+          <button onClick={onShowResults} className="mt-5 text-sm text-blue-200 hover:text-white underline underline-offset-4">
+            Lihat Hasil Pemilihan
+          </button>
+        )}
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-16 w-full text-left">
           <div className="bg-white/5 backdrop-blur-sm p-6 rounded-2xl border border-white/10">
@@ -583,9 +674,7 @@ function VoterLoginPage({
         </button>
 
         <div className="text-center mb-8">
-          <div className="w-16 h-16 bg-blue-100 text-blue-700 rounded-2xl flex items-center justify-center mx-auto mb-3 font-bold text-2xl shadow-inner">
-            OSIS
-          </div>
+          <SchoolLogo className="w-16 h-16 mx-auto mb-3" />
           <h2 className="text-2xl font-extrabold text-slate-800">Verifikasi Pemilih</h2>
           <p className="text-sm text-slate-500 mt-1">Masukkan Nama dan Kelas Anda untuk melanjutkan</p>
         </div>
@@ -736,7 +825,7 @@ function VotingFlowPage({
                   <div 
                     key={c.id} 
                     className={`bg-white rounded-3xl border-2 transition-all duration-200 overflow-hidden shadow-sm flex flex-col justify-between ${
-                      isSelected ? 'border-blue-600 ring-4 ring-blue-100 shadow-xl scale-102' : 'border-slate-200 hover:border-slate-300'
+                      isSelected ? 'border-blue-600 ring-4 ring-blue-100 shadow-xl' : 'border-slate-200 hover:border-slate-300'
                     }`}
                   >
                     <div className="p-6 text-center flex-1">
@@ -1043,7 +1132,7 @@ function AdminLoginPage({ onSuccess, onBack }: { onSuccess: () => void; onBack: 
 
   const handleAdminLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (username === 'admin' && password === 'admin123') {
+    if (username === ADMIN_USER && password === ADMIN_PASS) {
       onSuccess();
     } else {
       setError('Username atau Password Administrator salah.');
@@ -1102,9 +1191,12 @@ function AdminLoginPage({ onSuccess, onBack }: { onSuccess: () => void; onBack: 
           </button>
         </form>
 
-        <div className="mt-6 bg-slate-800/50 p-3 rounded-xl border border-slate-700/50 text-center text-xs text-amber-400/80">
-          🔑 Demo Credentials: <strong>admin</strong> / <strong>admin123</strong>
-        </div>
+        {ADMIN_PASS === 'admin123' && (
+          <div className="mt-6 bg-slate-800/50 p-3 rounded-xl border border-slate-700/50 text-center text-xs text-amber-400/80">
+            🔑 Demo Credentials: <strong>admin</strong> / <strong>admin123</strong><br />
+            Demo credentials only. Ganti password sebelum dipakai (lihat catatan di README).
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1148,14 +1240,12 @@ function AdminDashboardPage({
   const femaleVoted = votersDB.filter(v => v.gender === 'P' && v.has_voted).length;
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col md:flex-row">
+    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col md:flex-row print:block print:bg-white">
       {/* Sidebar */}
-      <aside className="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between p-4">
+      <aside className="print:hidden w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between p-4">
         <div>
           <div className="flex items-center gap-3 p-3 mb-6 bg-slate-900 rounded-2xl border border-slate-800">
-            <div className="w-10 h-10 bg-amber-400 text-slate-950 font-black rounded-xl flex items-center justify-center">
-              OSIS
-            </div>
+            <SchoolLogo className="w-10 h-10" />
             <div className="overflow-hidden">
               <h2 className="font-bold text-xs truncate text-white">{settings.name}</h2>
               <span className="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">
@@ -1425,11 +1515,15 @@ function AdminVotersManager({ votersDB, setVotersDB, addLog }: any) {
     });
   }, [votersDB, searchTerm, filterClass, filterStatus]);
 
-  const classList = useMemo(() => Array.from(new Set(votersDB.map((v: Voter) => v.class))), [votersDB]);
+  const classList = useMemo(() => Array.from(new Set<string>(votersDB.map((v: Voter) => v.class))), [votersDB]);
 
   const handleAddVoter = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim() || !newClass.trim()) return;
+    if (votersDB.some((v: Voter) => v.name.trim().toLowerCase() === newName.trim().toLowerCase() && v.class.trim().toLowerCase() === newClass.trim().toLowerCase())) {
+      alert('Pemilih dengan nama dan kelas yang sama sudah terdaftar.');
+      return;
+    }
 
     const newVoter: Voter = {
       id: 'v-' + Date.now(),
@@ -1446,6 +1540,10 @@ function AdminVotersManager({ votersDB, setVotersDB, addLog }: any) {
   };
 
   const handleDeleteVoter = (id: string, name: string) => {
+    if (votersDB.find((v: Voter) => v.id === id)?.has_voted) {
+      alert('Pemilih yang sudah memilih tidak dapat dihapus agar data partisipasi tetap utuh.');
+      return;
+    }
     if (confirm(`Hapus pemilih ${name}?`)) {
       setVotersDB((prev: Voter[]) => prev.filter((v: Voter) => v.id !== id));
       addLog('Hapus Pemilih', `Menghapus pemilih ID: ${id}`);
@@ -1459,28 +1557,34 @@ function AdminVotersManager({ votersDB, setVotersDB, addLog }: any) {
 
     const reader = new FileReader();
     reader.onload = (evt) => {
-      const text = evt.target?.result as string;
-      const lines = text.split('\n').filter(l => l.trim() !== '');
-      
+      const text = String(evt.target?.result ?? '').replace(/^\uFEFF/, '');
+      const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+      const delim = (lines[0] || '').includes(';') ? ';' : ',';
+      const keyOf = (n: string, c: string) => `${n.trim().toLowerCase()}|${c.trim().toLowerCase()}`;
+      const existing = new Set<string>(votersDB.map((v: Voter) => keyOf(v.name, v.class)));
       const newVoters: Voter[] = [];
+      let duplicates = 0;
+      let invalid = 0;
+
       lines.slice(1).forEach((line, index) => {
-        const [name, className, gender] = line.split(',').map(s => s.trim());
-        if (name && className) {
-          newVoters.push({
-            id: 'v-csv-' + Date.now() + '-' + index,
-            name,
-            class: className,
-            gender: (gender?.toUpperCase() === 'P' ? 'P' : 'L'),
-            has_voted: false,
-          });
-        }
+        const [name, className, gender] = line.split(delim).map(t => t.trim().replace(/^"|"$/g, ''));
+        if (!name || !className) { invalid++; return; }
+        const key = keyOf(name, className);
+        if (existing.has(key)) { duplicates++; return; }
+        existing.add(key);
+        newVoters.push({
+          id: 'v-csv-' + Date.now() + '-' + index,
+          name,
+          class: className,
+          gender: ['p', 'perempuan'].includes((gender || '').toLowerCase()) ? 'P' : 'L',
+          has_voted: false,
+        });
       });
 
-      if (newVoters.length > 0) {
-        setVotersDB((prev: Voter[]) => [...newVoters, ...prev]);
-        addLog('Import CSV', `Berhasil mengimpor ${newVoters.length} pemilih.`);
-        alert(`Berhasil mengimpor ${newVoters.length} data pemilih!`);
-      }
+      if (newVoters.length > 0) setVotersDB((prev: Voter[]) => [...newVoters, ...prev]);
+      addLog('Import CSV', `${newVoters.length} berhasil, ${duplicates} duplikat, ${invalid} tidak valid.`);
+      alert(`${newVoters.length} data berhasil diimpor.` + (duplicates ? ` Terdapat ${duplicates} data duplikat (dilewati).` : '') + (invalid ? ` ${invalid} baris tidak valid (dilewati).` : ''));
+      e.target.value = '';
     };
     reader.readAsText(file);
   };
@@ -1619,134 +1723,137 @@ function AdminVotersManager({ votersDB, setVotersDB, addLog }: any) {
 
 // Sub-component: Candidates Management
 function AdminCandidatesManager({ type, candidates, setCandidates, addLog }: any) {
-  const activeCandidates = useMemo(() => candidates.filter((c: Candidate) => c.type === type), [candidates, type]);
+  const list: Candidate[] = useMemo(
+    () => candidates.filter((c: Candidate) => c.type === type).sort((a: Candidate, b: Candidate) => a.number - b.number),
+    [candidates, type]
+  );
+  const nextNumber = list.length ? Math.max(...list.map(c => c.number)) + 1 : 1;
+  const blank = { number: nextNumber, name: '', class: '', vision: '', mission: '', photo_url: '' };
+  const [form, setForm] = useState(blank);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const label = type === 'ketua' ? 'Ketua' : 'Wakil Ketua';
+  const setField = (k: string, v: string | number) => setForm(f => ({ ...f, [k]: v }));
 
-  const [number, setNumber] = useState(1);
-  const [name, setName] = useState('');
-  const [candidateClass, setCandidateClass] = useState('');
-  const [vision, setVision] = useState('');
-  const [mission, setMission] = useState('');
-  const [photoUrl, setPhotoUrl] = useState('');
+  useEffect(() => {
+    if (!editingId) setForm(f => ({ ...f, number: nextNumber }));
+  }, [nextNumber, editingId]);
 
-  const handleAddCandidate = (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name || !candidateClass) return;
-
-    const newCandidate: Candidate = {
-      id: type[0] + Date.now(),
-      type,
-      number: Number(number),
-      name,
-      class: candidateClass,
-      vision,
-      mission,
-      photo_url: photoUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=0D8ABC&color=fff&size=200`,
-      is_active: true,
-    };
-
-    setCandidates((prev: Candidate[]) => [...prev, newCandidate]);
-    addLog('Tambah Calon', `Menambahkan Calon ${type}: ${name}`);
-    setName('');
-    setCandidateClass('');
-    setVision('');
-    setMission('');
-    setPhotoUrl('');
+    setError('');
+    const name = form.name.trim();
+    const cls = form.class.trim();
+    if (!name || !cls) return setError('Nama dan kelas calon wajib diisi.');
+    if (candidates.some((c: Candidate) => c.type === type && c.number === Number(form.number) && c.id !== editingId)) {
+      return setError('Nomor urut sudah dipakai calon lain.');
+    }
+    const photo = form.photo_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=0D8ABC&color=fff&size=200`;
+    if (editingId) {
+      setCandidates((prev: Candidate[]) => prev.map(c => c.id === editingId
+        ? { ...c, number: Number(form.number), name, class: cls, vision: form.vision, mission: form.mission, photo_url: photo }
+        : c));
+      addLog('Edit Calon', `Mengubah calon ${label}: ${name}`);
+    } else {
+      setCandidates((prev: Candidate[]) => [...prev, {
+        id: type[0] + Date.now(), type, number: Number(form.number), name, class: cls,
+        vision: form.vision, mission: form.mission, photo_url: photo, is_active: true,
+      }]);
+      addLog('Tambah Calon', `Menambahkan calon ${label}: ${name}`);
+    }
+    setEditingId(null);
+    setForm({ ...blank, number: nextNumber + (editingId ? 0 : 1) });
   };
 
-  const handleDeleteCandidate = (id: string, name: string) => {
-    if (confirm(`Hapus calon ${name}?`)) {
-      setCandidates((prev: Candidate[]) => prev.filter((c: Candidate) => c.id !== id));
-      addLog('Hapus Calon', `Menghapus calon ID: ${id}`);
+  const startEdit = (c: Candidate) => {
+    setEditingId(c.id);
+    setError('');
+    setForm({ number: c.number, name: c.name, class: c.class, vision: c.vision, mission: c.mission, photo_url: c.photo_url });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const toggleActive = (c: Candidate) => {
+    setCandidates((prev: Candidate[]) => prev.map(x => x.id === c.id ? { ...x, is_active: !x.is_active } : x));
+    addLog('Ubah Status Calon', `${c.name} ${c.is_active ? 'dinonaktifkan' : 'diaktifkan'}.`);
+  };
+
+  const handleDelete = (c: Candidate) => {
+    let stored: Vote[] = [];
+    try { stored = JSON.parse(localStorage.getItem('evoting_votes') || '[]'); } catch { /* abaikan */ }
+    if (stored.some(v => v.candidate_id === c.id)) {
+      alert('Calon ini sudah menerima suara dan tidak dapat dihapus. Nonaktifkan saja.');
+      return;
+    }
+    if (confirm(`Hapus calon ${c.name}?`)) {
+      setCandidates((prev: Candidate[]) => prev.filter(x => x.id !== c.id));
+      addLog('Hapus Calon', `Menghapus calon ${label}: ${c.name}`);
     }
   };
 
+  const onPhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try { setField('photo_url', await resizeImage(f, 400)); setError(''); }
+    catch (err) { setError((err as Error).message); }
+    e.target.value = '';
+  };
+
+  const input = "bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white";
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-2xl font-black text-white">Data Calon {type === 'ketua' ? 'Ketua' : 'Wakil Ketua'} OSIS</h2>
-        <p className="text-xs text-slate-400">Kelola daftar calon yang akan ditampilkan pada bilik suara digital.</p>
+        <h2 className="text-2xl font-black text-white">Data Calon {label} OSIS</h2>
+        <p className="text-xs text-slate-400">Hanya calon berstatus aktif yang tampil di bilik suara. Jumlah calon tidak dibatasi.</p>
       </div>
 
-      {/* Add Candidate Form */}
-      <form onSubmit={handleAddCandidate} className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-4">
-        <h3 className="font-bold text-sm text-white">Tambah Calon Baru</h3>
+      <form onSubmit={handleSubmit} className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-4">
+        <h3 className="font-bold text-sm text-white">{editingId ? 'Edit Calon' : 'Tambah Calon Baru'}</h3>
+        {error && <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-xl p-3">{error}</p>}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <input 
-            type="number" 
-            placeholder="Nomor Urut"
-            className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white"
-            value={number}
-            onChange={e => setNumber(Number(e.target.value))}
-            required
-          />
-          <input 
-            type="text" 
-            placeholder="Nama Lengkap Calon"
-            className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white"
-            value={name}
-            onChange={e => setName(e.target.value)}
-            required
-          />
-          <input 
-            type="text" 
-            placeholder="Kelas Calon"
-            className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white"
-            value={candidateClass}
-            onChange={e => setCandidateClass(e.target.value)}
-            required
-          />
+          <input type="number" min={1} placeholder="Nomor Urut" className={input} value={form.number} onChange={e => setField('number', Number(e.target.value))} required />
+          <input type="text" placeholder="Nama Lengkap Calon" className={input} value={form.name} onChange={e => setField('name', e.target.value)} required />
+          <input type="text" placeholder="Kelas Calon" className={input} value={form.class} onChange={e => setField('class', e.target.value)} required />
         </div>
-
-        <input 
-          type="url" 
-          placeholder="URL Foto (opsional, default UI Avatar)"
-          className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white w-full"
-          value={photoUrl}
-          onChange={e => setPhotoUrl(e.target.value)}
-        />
-
-        <textarea 
-          placeholder="Visi Calon"
-          className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white w-full h-16"
-          value={vision}
-          onChange={e => setVision(e.target.value)}
-        ></textarea>
-
-        <textarea 
-          placeholder="Misi Calon"
-          className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white w-full h-20"
-          value={mission}
-          onChange={e => setMission(e.target.value)}
-        ></textarea>
-
-        <button type="submit" className="bg-blue-600 hover:bg-blue-500 font-bold text-xs text-white rounded-xl py-3 px-6">
-          Simpan Calon
-        </button>
+        <div className="flex items-center gap-4">
+          <img src={form.photo_url || 'https://ui-avatars.com/api/?name=?&background=334155&color=fff&size=100'} alt="Pratinjau foto" className="w-16 h-16 rounded-xl object-cover bg-slate-900" />
+          <label className="bg-slate-900 hover:bg-slate-700 border border-slate-700 text-xs text-white font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+            Upload / Ganti Foto
+            <input type="file" accept="image/*" className="hidden" onChange={onPhoto} />
+          </label>
+          <span className="text-[10px] text-slate-500">Foto dikecilkan otomatis.</span>
+        </div>
+        <textarea placeholder="Visi Calon" className={`${input} w-full h-16`} value={form.vision} onChange={e => setField('vision', e.target.value)}></textarea>
+        <textarea placeholder="Misi Calon (satu misi per baris)" className={`${input} w-full h-20`} value={form.mission} onChange={e => setField('mission', e.target.value)}></textarea>
+        <div className="flex gap-2">
+          <button type="submit" className="bg-blue-600 hover:bg-blue-500 font-bold text-xs text-white rounded-xl py-3 px-6">{editingId ? 'Simpan Perubahan' : 'Simpan Calon'}</button>
+          {editingId && (
+            <button type="button" onClick={() => { setEditingId(null); setForm({ ...blank, number: nextNumber }); setError(''); }} className="bg-slate-700 hover:bg-slate-600 font-bold text-xs text-white rounded-xl py-3 px-6">Batal</button>
+          )}
+        </div>
       </form>
 
-      {/* Candidates List */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {activeCandidates.map((c: Candidate) => (
-          <div key={c.id} className="bg-slate-800 rounded-2xl border border-slate-700 p-5 relative flex flex-col justify-between">
-            <button 
-              onClick={() => handleDeleteCandidate(c.id, c.name)}
-              className="absolute top-4 right-4 text-red-400 hover:text-red-300"
-            >
-              <IconTrash className="w-5 h-5" />
-            </button>
-
+        {list.length === 0 && <p className="text-xs text-slate-500">Belum ada calon {label}.</p>}
+        {list.map((c) => (
+          <div key={c.id} className={`bg-slate-800 rounded-2xl border border-slate-700 p-5 flex flex-col justify-between ${c.is_active ? '' : 'opacity-60'}`}>
             <div>
               <div className="flex items-center gap-4 mb-4">
                 <img src={c.photo_url} alt={c.name} className="w-16 h-16 rounded-xl object-cover" />
-                <div>
+                <div className="min-w-0">
                   <span className="text-xs font-bold bg-amber-400 text-slate-950 px-2 py-0.5 rounded">0{c.number}</span>
-                  <h4 className="font-bold text-white text-base">{c.name}</h4>
+                  <h4 className="font-bold text-white text-base truncate">{c.name}</h4>
                   <span className="text-xs text-slate-400">{c.class}</span>
                 </div>
               </div>
-
-              <div className="text-xs text-slate-300 space-y-2 mb-4">
-                <p><strong>Visi:</strong> "{c.vision}"</p>
+              <p className="text-xs text-slate-300 mb-4 line-clamp-3"><strong>Visi:</strong> "{c.vision}"</p>
+            </div>
+            <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-700">
+              <button onClick={() => toggleActive(c)} className={`text-[10px] font-bold px-3 py-1 rounded-full ${c.is_active ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-700 text-slate-300'}`}>
+                {c.is_active ? 'AKTIF' : 'NONAKTIF'}
+              </button>
+              <div className="flex gap-3 text-xs font-bold">
+                <button onClick={() => startEdit(c)} className="text-blue-400 hover:text-blue-300">Edit</button>
+                <button onClick={() => handleDelete(c)} className="text-red-400 hover:text-red-300 flex items-center gap-1"><IconTrash className="w-4 h-4" /></button>
               </div>
             </div>
           </div>
@@ -1756,70 +1863,103 @@ function AdminCandidatesManager({ type, candidates, setCandidates, addLog }: any
   );
 }
 
-// Sub-component: Election Results View
-function AdminResultsView({ settings, candidates, votes, votedCount }: any) {
-  const ketuaCandidates = candidates.filter((c: Candidate) => c.type === 'ketua');
-  const wakilCandidates = candidates.filter((c: Candidate) => c.type === 'wakil');
+// Hitung perolehan suara per jenis calon (peringkat + persentase dari total suara jenis tsb)
+function computeResults(candidates: Candidate[], votes: Vote[], type: CandidateType) {
+  const list = candidates.filter(c => c.type === type).map(c => ({ c, count: votes.filter(v => v.candidate_id === c.id).length }));
+  const total = list.reduce((sum, x) => sum + x.count, 0);
+  const sorted = [...list].sort((a, b) => b.count - a.count || a.c.number - b.c.number);
+  return {
+    total,
+    rows: sorted.map(x => ({
+      ...x,
+      percent: total ? Math.round((x.count / total) * 1000) / 10 : 0,
+      rank: 1 + sorted.filter(o => o.count > x.count).length,
+    })),
+  };
+}
 
-  const getVoteCount = (candidateId: string) => votes.filter((v: Vote) => v.candidate_id === candidateId).length;
-
+function ResultsPanel({ candidates, votes, showWinners }: { candidates: Candidate[]; votes: Vote[]; showWinners: boolean }) {
   return (
     <div className="space-y-8">
+      {(['ketua', 'wakil'] as CandidateType[]).map(type => {
+        const { total, rows } = computeResults(candidates, votes, type);
+        const winners = rows.filter(r => r.rank === 1 && r.count > 0);
+        const bar = type === 'ketua' ? 'bg-blue-500' : 'bg-emerald-500';
+        return (
+          <div key={type} className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-5">
+            <h3 className="text-lg font-bold text-white border-b border-slate-700 pb-3">
+              HASIL PEROLEHAN SUARA {type === 'ketua' ? 'KETUA' : 'WAKIL KETUA'} OSIS <span className="text-xs font-normal text-slate-400">({total} suara)</span>
+            </h3>
+            {showWinners && winners.length > 0 && (
+              <div className="bg-amber-400/10 border border-amber-400/40 rounded-2xl p-4 flex items-center gap-4">
+                <IconTrophy className="w-8 h-8 text-amber-400 shrink-0" />
+                <div>
+                  <p className="text-xs font-bold text-amber-400 uppercase">{winners.length > 1 ? 'Suara seri' : 'Pemenang'}</p>
+                  <p className="font-extrabold text-white">{winners.map(w => `0${w.c.number} ${w.c.name}`).join(' & ')}</p>
+                  <p className="text-xs text-slate-300">Memperoleh {winners[0].count} suara ({winners[0].percent}%)</p>
+                </div>
+              </div>
+            )}
+            {rows.length === 0 && <p className="text-xs text-slate-500">Belum ada calon.</p>}
+            {rows.map(({ c, count, percent, rank }) => (
+              <div key={c.id} className="bg-slate-900 p-4 rounded-xl border border-slate-800">
+                <div className="flex justify-between items-center mb-2 gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className={`w-6 h-6 shrink-0 text-xs font-bold rounded-full flex items-center justify-center ${rank === 1 && count > 0 ? 'bg-amber-400 text-slate-950' : 'bg-slate-700 text-white'}`}>{rank}</span>
+                    <span className="font-bold text-white text-sm truncate">0{c.number} {c.name} <span className="text-slate-400 font-normal">({c.class})</span></span>
+                  </div>
+                  <span className="text-sm font-black text-white whitespace-nowrap">{count} suara <span className="text-slate-400 font-normal">({percent}%)</span></span>
+                </div>
+                <div className="w-full bg-slate-800 h-3 rounded-full overflow-hidden">
+                  <div className={`${bar} h-full transition-all duration-500`} style={{ width: `${percent}%` }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Sub-component: Election Results View (admin selalu melihat hasil lengkap)
+function AdminResultsView({ settings, candidates, votes }: any) {
+  return (
+    <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-black text-white">Perhitungan Suara (Hasil Pemilihan)</h2>
-        <p className="text-xs text-slate-400">Hasil suara tersimpan terpisah dari identitas siswa untuk menjaga kerahasiaan.</p>
+        <p className="text-xs text-slate-400">
+          Status: <span className="font-bold text-amber-400 uppercase">{settings.status}</span>. Suara tersimpan terpisah dari identitas siswa.
+        </p>
       </div>
+      <ResultsPanel candidates={candidates} votes={votes} showWinners={true} />
+    </div>
+  );
+}
 
-      {/* Ketua Results */}
-      <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-6">
-        <h3 className="text-lg font-bold text-white border-b border-slate-700 pb-3">HASIL PEROLEHAN SUARA KETUA OSIS</h3>
-        
-        <div className="space-y-4">
-          {ketuaCandidates.map((c: Candidate) => {
-            const count = getVoteCount(c.id);
-            const percentage = votedCount > 0 ? Math.round((count / votedCount) * 100) : 0;
-            return (
-              <div key={c.id} className="bg-slate-900 p-4 rounded-xl border border-slate-800">
-                <div className="flex justify-between items-center mb-2">
-                  <div className="flex items-center gap-3">
-                    <span className="w-6 h-6 bg-blue-600 text-white font-bold text-xs rounded-full flex items-center justify-center">0{c.number}</span>
-                    <span className="font-bold text-white text-sm">{c.name} ({c.class})</span>
-                  </div>
-                  <span className="text-sm font-black text-blue-400">{count} suara ({percentage}%)</span>
-                </div>
-                <div className="w-full bg-slate-800 h-3 rounded-full overflow-hidden">
-                  <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${percentage}%` }}></div>
-                </div>
-              </div>
-            );
-          })}
+// Halaman hasil untuk publik (dikontrol lewat Pengaturan)
+function PublicResultsPage({ settings, candidates, votes, onBack }: { settings: SchoolSettings; candidates: Candidate[]; votes: Vote[]; onBack: () => void }) {
+  const finished = settings.status === 'selesai';
+  const visible = settings.showResults && settings.status !== 'belum_mulai';
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-6">
+      <div className="max-w-3xl mx-auto space-y-6">
+        <button onClick={onBack} className="text-xs text-slate-400 hover:text-white">&larr; Kembali ke Beranda</button>
+        <div className="flex items-center gap-3">
+          <SchoolLogo className="w-12 h-12" />
+          <div>
+            <h1 className="font-extrabold text-xl text-white">Hasil Pemilihan OSIS</h1>
+            <p className="text-xs text-slate-400">{settings.name} - {settings.year}</p>
+          </div>
         </div>
-      </div>
-
-      {/* Wakil Results */}
-      <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-6">
-        <h3 className="text-lg font-bold text-white border-b border-slate-700 pb-3">HASIL PEROLEHAN SUARA WAKIL KETUA OSIS</h3>
-        
-        <div className="space-y-4">
-          {wakilCandidates.map((c: Candidate) => {
-            const count = getVoteCount(c.id);
-            const percentage = votedCount > 0 ? Math.round((count / votedCount) * 100) : 0;
-            return (
-              <div key={c.id} className="bg-slate-900 p-4 rounded-xl border border-slate-800">
-                <div className="flex justify-between items-center mb-2">
-                  <div className="flex items-center gap-3">
-                    <span className="w-6 h-6 bg-emerald-600 text-white font-bold text-xs rounded-full flex items-center justify-center">0{c.number}</span>
-                    <span className="font-bold text-white text-sm">{c.name} ({c.class})</span>
-                  </div>
-                  <span className="text-sm font-black text-emerald-400">{count} suara ({percentage}%)</span>
-                </div>
-                <div className="w-full bg-slate-800 h-3 rounded-full overflow-hidden">
-                  <div className="bg-emerald-500 h-full transition-all duration-500" style={{ width: `${percentage}%` }}></div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        {!visible ? (
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-8 text-center text-sm text-slate-300">Hasil belum dapat ditampilkan.</div>
+        ) : (
+          <>
+            {!finished && <p className="text-xs text-amber-300 bg-amber-400/10 border border-amber-400/30 rounded-xl p-3">Hasil sementara. Pemilihan belum selesai.</p>}
+            <ResultsPanel candidates={candidates} votes={votes} showWinners={settings.showWinners && finished} />
+          </>
+        )}
       </div>
     </div>
   );
@@ -1866,45 +2006,60 @@ function AdminMonitoringView({ votersDB }: any) {
   );
 }
 
-// Sub-component: Google Sheets Integration Simulator
+// Sub-component: Export untuk Google Sheets
+// CATATAN: aplikasi ini berjalan sepenuhnya di browser (tanpa server), sehingga tidak bisa memanggil
+// Google Sheets API dengan aman. Gunakan export CSV lalu impor ke Google Sheets (File > Import).
 function AdminGoogleSheetsSync({ votersDB, votes, candidates, addLog }: any) {
-  const [isSyncing, setIsSyncing] = useState(false);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const fmt = (iso?: string) => (iso ? new Date(iso).toLocaleString('id-ID') : '');
+  const voted = votersDB.filter((v: Voter) => v.has_voted);
 
-  const handleSyncToSheets = () => {
-    setIsSyncing(true);
-    setTimeout(() => {
-      setIsSyncing(false);
-      addLog('Google Sheets Sync', 'Sinkronisasi manual ke Google Sheets berhasil.');
-      alert('Berhasil mensinkronkan data pemilih dan rekapitulasi suara ke Google Spreadsheet!');
-    }, 1500);
-  };
+  const files: { label: string; sheet: string; build: () => (string | number)[][] }[] = [
+    {
+      label: 'Sheet 1: Data Pemilih', sheet: 'data-pemilih',
+      build: () => [['ID', 'NAMA', 'KELAS', 'JENIS KELAMIN', 'STATUS', 'WAKTU MEMILIH'],
+        ...votersDB.map((v: Voter) => [v.id, v.name, v.class, v.gender === 'L' ? 'Laki-laki' : 'Perempuan', v.has_voted ? 'SUDAH MEMILIH' : 'BELUM MEMILIH', fmt(v.voted_at)])],
+    },
+    {
+      label: 'Sheet 2: Hasil Suara', sheet: 'hasil-suara',
+      build: () => [['CALON', 'JENIS', 'JUMLAH SUARA', 'PERSENTASE'],
+        ...(['ketua', 'wakil'] as CandidateType[]).flatMap(t =>
+          computeResults(candidates, votes, t).rows.map(r => [`0${r.c.number} - ${r.c.name}`, t === 'ketua' ? 'KETUA OSIS' : 'WAKIL KETUA OSIS', r.count, `${r.percent}%`]))],
+    },
+    {
+      label: 'Sheet 3: Rekap', sheet: 'rekap',
+      build: () => [['KETERANGAN', 'JUMLAH'],
+        ['TOTAL PEMILIH', votersDB.length], ['SUDAH MEMILIH', voted.length], ['BELUM MEMILIH', votersDB.length - voted.length],
+        ['LAKI-LAKI', votersDB.filter((v: Voter) => v.gender === 'L').length], ['PEREMPUAN', votersDB.filter((v: Voter) => v.gender === 'P').length]],
+    },
+    {
+      label: 'Sheet 4: Log Pemilihan', sheet: 'log-pemilihan',
+      build: () => [['ID PEMILIH', 'KELAS', 'WAKTU MEMILIH'], ...voted.map((v: Voter) => [v.id, v.class, fmt(v.voted_at)])],
+    },
+  ];
 
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-2xl font-black text-white">Integrasi Google Sheets API</h2>
-        <p className="text-xs text-slate-400">Sinkronkan data kehadiran pemilih dan rekap suara secara aman ke Google Spreadsheet.</p>
+        <h2 className="text-2xl font-black text-white">Export untuk Google Sheets</h2>
+        <p className="text-xs text-slate-400">Unduh 4 file CSV dengan struktur sheet standar, lalu impor ke Google Sheets.</p>
       </div>
 
-      <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-emerald-500/20 text-emerald-400 rounded-xl flex items-center justify-center">
-            <IconSpreadsheet className="w-6 h-6" />
-          </div>
-          <div>
-            <h3 className="font-bold text-white text-sm">Status Sinkronisasi Google Sheets</h3>
-            <span className="text-xs text-emerald-400 font-semibold">● Terhubung dengan Service Account</span>
-          </div>
-        </div>
+      <div className="bg-amber-400/10 border border-amber-400/30 text-amber-200 text-xs rounded-2xl p-4 leading-relaxed">
+        <strong>Mode prototipe:</strong> sinkronisasi otomatis ke Google Sheets belum aktif karena membutuhkan server untuk menyimpan kunci API dengan aman.
+        Gunakan tombol di bawah, lalu di Google Sheets pilih <em>File &rarr; Import &rarr; Upload</em>.
+      </div>
 
-        <button 
-          onClick={handleSyncToSheets}
-          disabled={isSyncing}
-          className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-6 py-3 rounded-xl transition flex items-center gap-2"
-        >
-          <IconRefresh className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
-          <span>{isSyncing ? 'Mengirim Data...' : 'SINKRONKAN KE GOOGLE SHEETS SEKARANG'}</span>
-        </button>
+      <div className="bg-slate-800 p-6 rounded-2xl border border-slate-700 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {files.map(f => (
+          <button
+            key={f.sheet}
+            onClick={() => { downloadCSV(`${f.sheet}-${stamp}.csv`, f.build()); addLog('Export Data', `Mengunduh ${f.label}.`); }}
+            className="bg-slate-900 hover:bg-slate-700 border border-slate-700 text-white font-bold text-xs px-4 py-3 rounded-xl transition flex items-center gap-2"
+          >
+            <IconSpreadsheet className="w-4 h-4 text-emerald-400" /> {f.label} (.csv)
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -1953,7 +2108,7 @@ function AdminReportsView({ settings, votersDB, candidates, votes }: any) {
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex justify-between items-center print:hidden">
         <div>
           <h2 className="text-2xl font-black text-white">Cetak Laporan Pemilihan Resmi</h2>
           <p className="text-xs text-slate-400">Cetak rekapitulasi resmi dengan Kop Sekolah.</p>
@@ -1970,6 +2125,7 @@ function AdminReportsView({ settings, votersDB, candidates, votes }: any) {
       <div className="bg-white text-slate-900 p-8 rounded-2xl shadow-xl max-w-3xl mx-auto space-y-6 print:p-0 print:shadow-none">
         {/* School Header */}
         <div className="text-center border-b-2 border-slate-900 pb-4">
+          <SchoolLogo className="w-16 h-16 mx-auto mb-2" />
           <h1 className="font-extrabold text-xl uppercase tracking-wider">{settings.name}</h1>
           <p className="text-xs font-semibold">{settings.year}</p>
           <p className="text-[10px] text-slate-500">BERITA ACARA REKAPITULASI PEMILIHAN KETUA & WAKIL KETUA OSIS</p>
@@ -2048,66 +2204,111 @@ function AdminSettingsView({ settings, setSettings, addLog }: any) {
   const [name, setName] = useState(settings.name);
   const [year, setYear] = useState(settings.year);
   const [status, setStatus] = useState<ElectionStatus>(settings.status);
+  const [showResults, setShowResults] = useState<boolean>(settings.showResults);
+  const [showWinners, setShowWinners] = useState<boolean>(settings.showWinners);
+  const [logo, setLogo] = useState<string>(settings.logo || '');
+  const [error, setError] = useState('');
+
+  const onLogo = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try { setLogo(await resizeImage(f, 256)); setError(''); }
+    catch (err) { setError((err as Error).message); }
+    e.target.value = '';
+  };
 
   const handleSaveSettings = (e: React.FormEvent) => {
     e.preventDefault();
-    setSettings((prev: SchoolSettings) => ({
-      ...prev,
-      name,
-      year,
-      status,
-    }));
-    addLog('Pengaturan Sekolah', `Mengubah status ke: ${status}`);
-    alert('Pengaturan sekolah berhasil diperbarui!');
+    setError('');
+    if (status === 'berlangsung') {
+      let cands: Candidate[] = [];
+      try { cands = JSON.parse(localStorage.getItem('evoting_candidates') || '[]'); } catch { /* abaikan */ }
+      const active = (t: CandidateType) => cands.filter(c => c.type === t && c.is_active).length;
+      if (active('ketua') < 1 || active('wakil') < 1) {
+        setError('Pemilihan tidak bisa dimulai: minimal harus ada 1 calon Ketua dan 1 calon Wakil yang aktif.');
+        return;
+      }
+    }
+    setSettings((prev: SchoolSettings) => ({ ...prev, name, year, status, showResults, showWinners, logo: logo || undefined }));
+    if (status !== settings.status) addLog('Status Pemilihan', `Status diubah ke: ${status}`);
+    else addLog('Pengaturan Sekolah', 'Pengaturan diperbarui.');
+    alert('Pengaturan berhasil disimpan!');
   };
 
+  const resetData = (mode: 'kosong' | 'contoh') => {
+    const msg = mode === 'kosong'
+      ? 'Ini akan MENGHAPUS SEMUA pemilih, calon, suara, dan log, sehingga siap diisi data asli. Lanjutkan?'
+      : 'Ini akan mengembalikan SEMUA data ke data contoh (demo). Lanjutkan?';
+    if (!confirm(msg)) return;
+    if (prompt('Ketik HAPUS untuk konfirmasi') !== 'HAPUS') return;
+    if (mode === 'kosong') {
+      ['evoting_candidates', 'evoting_voters', 'evoting_votes'].forEach(k => localStorage.setItem(k, '[]'));
+      localStorage.setItem('evoting_logs', '[]');
+      localStorage.setItem('evoting_settings', JSON.stringify({ ...settings, status: 'belum_mulai' }));
+    } else {
+      ['evoting_settings', 'evoting_candidates', 'evoting_voters', 'evoting_votes', 'evoting_logs'].forEach(k => localStorage.removeItem(k));
+    }
+    window.location.reload();
+  };
+
+  const field = "w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-xs text-white";
+  const check = "w-4 h-4 accent-blue-600";
   return (
     <div className="space-y-6 max-w-xl">
       <div>
         <h2 className="text-2xl font-black text-white">Pengaturan Sekolah & Mode Pemilihan</h2>
-        <p className="text-xs text-slate-400">Atur status pemilihan dan identitas sekolah.</p>
+        <p className="text-xs text-slate-400">Atur identitas, logo, status pemilihan, dan tampilan hasil.</p>
       </div>
 
       <form onSubmit={handleSaveSettings} className="bg-slate-800 p-6 rounded-2xl border border-slate-700 space-y-4">
+        {error && <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-xl p-3">{error}</p>}
+
+        <div className="flex items-center gap-4">
+          <LogoCtx.Provider value={logo || '/logo.png'}><SchoolLogo className="w-16 h-16" /></LogoCtx.Provider>
+          <div className="flex flex-col gap-2">
+            <label className="bg-slate-900 hover:bg-slate-700 border border-slate-700 text-xs text-white font-bold px-4 py-2.5 rounded-xl cursor-pointer transition text-center">
+              Upload Logo Lembaga
+              <input type="file" accept="image/*" className="hidden" onChange={onLogo} />
+            </label>
+            {logo && <button type="button" onClick={() => setLogo('')} className="text-[10px] text-slate-400 hover:text-white">Pakai logo bawaan (/logo.png)</button>}
+          </div>
+        </div>
+
         <div>
           <label className="block text-xs font-bold text-slate-300 uppercase mb-2">Nama Sekolah</label>
-          <input 
-            type="text" 
-            className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-xs text-white"
-            value={name}
-            onChange={e => setName(e.target.value)}
-            required
-          />
+          <input type="text" className={field} value={name} onChange={e => setName(e.target.value)} required />
         </div>
-
         <div>
           <label className="block text-xs font-bold text-slate-300 uppercase mb-2">Tahun Pelajaran</label>
-          <input 
-            type="text" 
-            className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-xs text-white"
-            value={year}
-            onChange={e => setYear(e.target.value)}
-            required
-          />
+          <input type="text" className={field} value={year} onChange={e => setYear(e.target.value)} required />
         </div>
-
         <div>
           <label className="block text-xs font-bold text-slate-300 uppercase mb-2">Status Pemilihan</label>
-          <select 
-            className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-xs text-white font-bold"
-            value={status}
-            onChange={e => setStatus(e.target.value as ElectionStatus)}
-          >
-            <option value="belum_mulai">Belum Dimulai (Pendaftaran/Persiapan)</option>
+          <select className={`${field} font-bold`} value={status} onChange={e => setStatus(e.target.value as ElectionStatus)}>
+            <option value="belum_mulai">Belum Dimulai (Persiapan)</option>
             <option value="berlangsung">Sedang Berlangsung (Bilik Suara Buka)</option>
             <option value="selesai">Selesai (Pemilihan Ditutup)</option>
           </select>
         </div>
 
-        <button type="submit" className="bg-blue-600 hover:bg-blue-500 font-bold text-xs text-white rounded-xl py-3 px-6 w-full">
-          Simpan Perubahan
-        </button>
+        <div className="bg-slate-900 rounded-xl p-4 space-y-3 border border-slate-700">
+          <p className="text-xs font-bold text-slate-300 uppercase">Tampilan hasil untuk publik</p>
+          <label className="flex items-center gap-3 text-xs text-slate-200"><input type="checkbox" className={check} checked={showResults} onChange={e => setShowResults(e.target.checked)} /> Tampilkan hasil (sementara & akhir) di halaman depan</label>
+          <label className="flex items-center gap-3 text-xs text-slate-200"><input type="checkbox" className={check} checked={showWinners} onChange={e => setShowWinners(e.target.checked)} /> Tampilkan pemenang (setelah status Selesai)</label>
+          <p className="text-[10px] text-slate-500">Admin selalu dapat melihat hasil lengkap di menu Hasil Pemilihan.</p>
+        </div>
+
+        <button type="submit" className="bg-blue-600 hover:bg-blue-500 font-bold text-xs text-white rounded-xl py-3 px-6 w-full">Simpan Perubahan</button>
       </form>
+
+      <div className="bg-slate-800 p-6 rounded-2xl border border-red-500/30 space-y-3">
+        <h3 className="font-bold text-sm text-red-400">Zona Data</h3>
+        <p className="text-xs text-slate-400">Sebelum pemilihan sungguhan, kosongkan data contoh lalu isi pemilih & calon yang asli.</p>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => resetData('kosong')} className="bg-red-600 hover:bg-red-500 text-white font-bold text-xs px-4 py-2.5 rounded-xl">Kosongkan Semua Data</button>
+          <button onClick={() => resetData('contoh')} className="bg-slate-700 hover:bg-slate-600 text-white font-bold text-xs px-4 py-2.5 rounded-xl">Kembalikan Data Contoh</button>
+        </div>
+      </div>
     </div>
   );
 }
